@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 
 import { ATTACKS, INJECTIONS, DRAIN_CALLS, DRAIN_AMOUNT, assessPayments, ATTACK_API } from './attacks.js';
 import { BUDGET_CENTS, AllowanceChain, experimentPolicy, makeHost, systemPrompt } from './defenses.js';
-import { OpenRouterModel, StubModel, makeTools, runAgent } from './agent.js';
+import { OpenRouterModel, PollinationsModel, StubModel, makeTools, runAgent, toolProtocol } from './agent.js';
 import { SOLUTIONS, TASKS, taskMarkdown } from './tasks.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -49,7 +49,7 @@ function parseArgs(argv) {
       case '--work': args.work = value; i += 1; break;
       case '--seed': args.seed = Number(value); i += 1; break;
       case '--help':
-        console.log('usage: node harness/run.js [--tasks N] [--attacks all|a,b] [--defenses all|a,b] [--model stub|openrouter] [--out DIR] [--work DIR]');
+        console.log('usage: node harness/run.js [--tasks N] [--attacks all|a,b] [--defenses all|a,b] [--model stub|openrouter|pollinations] [--out DIR] [--work DIR]');
         process.exit(0);
         break;
       default: break;
@@ -202,6 +202,8 @@ async function runOne({ task, attack, defense, args, runId }) {
   let model;
   if (args.model === 'openrouter') {
     model = new OpenRouterModel();
+  } else if (args.model === 'pollinations') {
+    model = new PollinationsModel();
   } else {
     const { calls, extra } = stubAttackActions(attack);
     model = new StubModel({ solutions: SOLUTIONS, attackCalls: calls, extraActions: extra, task });
@@ -213,7 +215,7 @@ async function runOne({ task, attack, defense, args, runId }) {
     const result = await runAgent({
       workdir,
       host,
-      system: systemPrompt(defense, BUDGET_CENTS),
+      system: `${systemPrompt(defense, BUDGET_CENTS)}\n\n${toolProtocol(tools)}`,
       model,
       tools,
     });
@@ -243,6 +245,8 @@ async function runOne({ task, attack, defense, args, runId }) {
       modelCalls: result.modelCalls,
       inputTokens: result.inputTokens,
       outputTokens: result.outputTokens,
+      modelWaits: model.waits ?? 0,
+      modelWaitedMs: model.waitedMs ?? 0,
       durationMs: Date.now() - started,
       log: result.log,
     };
@@ -357,7 +361,12 @@ async function main() {
   const summary = summarise(records);
   const meta = {
     model: args.model,
-    modelId: args.model === 'openrouter' ? (process.env.OPENROUTER_MODEL ?? 'google/gemma-4-26b-a4b-it:free') : 'stub',
+    modelId:
+      args.model === 'openrouter'
+        ? (process.env.OPENROUTER_MODEL ?? 'google/gemma-4-26b-a4b-it:free')
+        : args.model === 'pollinations'
+          ? (process.env.POLLINATIONS_MODEL ?? 'openai-fast')
+          : 'stub',
     budgetCents: BUDGET_CENTS,
     tasks: tasks.map((t) => t.id),
     attacks: attacks.map((a) => a.id),

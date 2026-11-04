@@ -19,6 +19,11 @@ const execFileAsync = promisify(execFile);
 
 export const MAX_STEPS = 16;
 
+/** Wait for a number of milliseconds. */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Build the tools for one run.
  *
@@ -148,58 +153,173 @@ export class StubModel {
 }
 
 /**
- * A model served by OpenRouter, or any OpenAI compatible chat endpoint.
+ * A chat model served by any OpenAI compatible endpoint.
  *
  * The model is asked to answer with a small JSON object rather than to use the
  * provider tool calling format, because free endpoints vary in how well they
  * support that.
  */
-export class OpenRouterModel {
+export class ChatModel {
+  constructor({
+    model,
+    endpoint,
+    apiKey = null,
+    temperature = 0,
+    maxTokens = 600,
+    extraHeaders = {},
+    extraBody = {},
+    maxAttempts = 5,
+  }) {
+    this.model = model;
+    this.endpoint = endpoint;
+    this.apiKey = apiKey;
+    this.temperature = temperature;
+    this.maxTokens = maxTokens;
+    this.extraHeaders = extraHeaders;
+    this.extraBody = extraBody;
+    this.maxAttempts = maxAttempts;
+    this.calls = 0;
+    this.inputTokens = 0;
+    this.outputTokens = 0;
+    this.latencyMs = 0;
+    this.waits = 0;
+    this.waitedMs = 0;
+  }
+
+  /** Whether this backend can be used without a secret. */
+  get available() {
+    return true;
+  }
+
+  headers() {
+    const headers = { 'Content-Type': 'application/json', ...this.extraHeaders };
+    if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
+    return headers;
+  }
+
+  /**
+   * How long to wait before trying again.
+   *
+   * The free endpoints say so in the error body, for example "Retry after 35s".
+   * Honouring that exact number is both polite and faster than a blind
+   * exponential backoff.
+   *
+   * @param {Response} res
+   * @param {string} body
+   * @returns {number|null} Milliseconds to wait, or null when retrying is pointless.
+   */
+  static retryAfterMs(res, body) {
+    const header = res.headers.get('retry-after');
+    if (header) {
+      const seconds = Number(header);
+      if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+    }
+    const match = /retry after (\d+)s/i.exec(body ?? '');
+    if (match) return Number(match[1]) * 1000;
+    const inSeconds = /in (\d+) seconds/i.exec(body ?? '');
+    if (inSeconds) return Number(inSeconds[1]) * 1000;
+    if (res.status === 429) return 60_000;
+    return null;
+  }
+
+  async complete({ system, messages }) {
+    const body = {
+      model: this.model,
+      temperature: this.temperature,
+      max_tokens: this.maxTokens,
+      messages: [{ role: 'system', content: system }, ...messages],
+      ...this.extraBody,
+    };
+    const started = Date.now();
+    let lastError = 'no attempt was made';
+
+    for (let attempt = 0; attempt < this.maxAttempts; attempt += 1) {
+      const res = await fetch(this.endpoint, {
+        method: 'POST',
+        headers: this.headers(),
+        body: JSON.stringify(body),
+      });
+      const text = await res.text();
+      if (res.ok) {
+        const json = JSON.parse(text);
+        this.calls += 1;
+        this.latencyMs += Date.now() - started;
+        this.inputTokens += json.usage?.prompt_tokens ?? 0;
+        this.outputTokens += json.usage?.completion_tokens ?? 0;
+        const content = json.choices?.[0]?.message?.content ?? '';
+        return parseModelAction(content);
+      }
+
+      lastError = `model endpoint returned ${res.status}: ${text.slice(0, 300)}`;
+      const waitMs = ChatModel.retryAfterMs(res, text);
+      if (waitMs === null || attempt === this.maxAttempts - 1) break;
+      this.waits += 1;
+      this.waitedMs += waitMs;
+      await sleep(waitMs);
+    }
+
+    throw new Error(lastError);
+  }
+}
+
+/**
+ * Gemma 4 on OpenRouter. This is the primary model arm and it needs a key.
+ */
+export class OpenRouterModel extends ChatModel {
   constructor({
     model = process.env.OPENROUTER_MODEL ?? 'google/gemma-4-26b-a4b-it:free',
     apiKey = process.env.OPENROUTER_API_KEY,
     endpoint = process.env.OPENROUTER_ENDPOINT ?? 'https://openrouter.ai/api/v1/chat/completions',
     temperature = 0,
   } = {}) {
-    this.model = model;
-    this.apiKey = apiKey;
-    this.endpoint = endpoint;
-    this.temperature = temperature;
-    this.calls = 0;
-    this.inputTokens = 0;
-    this.outputTokens = 0;
+    super({ model, endpoint, apiKey, temperature });
   }
 
   get available() {
     return Boolean(this.apiKey);
   }
+}
 
-  async complete({ system, messages }) {
-    if (!this.apiKey) throw new Error('OPENROUTER_API_KEY is not set');
-    const body = {
-      model: this.model,
-      temperature: this.temperature,
-      messages: [{ role: 'system', content: system }, ...messages],
-    };
-    const res = await fetch(this.endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`model endpoint returned ${res.status}: ${text.slice(0, 300)}`);
-    }
-    const json = await res.json();
-    this.calls += 1;
-    this.inputTokens += json.usage?.prompt_tokens ?? 0;
-    this.outputTokens += json.usage?.completion_tokens ?? 0;
-    const content = json.choices?.[0]?.message?.content ?? '';
-    return parseModelAction(content);
+/**
+ * A no key backend, used to exercise the model arm before any key exists and
+ * to check that the result does not depend on one particular model.
+ */
+export class PollinationsModel extends ChatModel {
+  constructor({
+    model = process.env.POLLINATIONS_MODEL ?? 'openai-fast',
+    endpoint = process.env.POLLINATIONS_ENDPOINT ?? 'https://text.pollinations.ai/openai',
+    apiKey = process.env.POLLINATIONS_API_KEY ?? null,
+    temperature = 0,
+  } = {}) {
+    super({ model, endpoint, apiKey, temperature });
   }
+}
+
+/**
+ * The protocol the model has to answer in.
+ *
+ * The model sees the tool list and answers with one JSON object per turn.
+ * Asking for JSON instead of provider tool calls keeps the free endpoints
+ * honest, because they all speak JSON even when they do not speak tool calls.
+ *
+ * @param {Record<string, {description: string, parameters: object}>} tools
+ * @returns {string}
+ */
+export function toolProtocol(tools) {
+  const lines = Object.entries(tools).map(([name, tool]) => {
+    const args = Object.keys(tool.parameters ?? {}).join(', ') || 'none';
+    return `- ${name}: ${tool.description} (arguments: ${args})`;
+  });
+  return `You act through tools. Answer with exactly one JSON object and nothing else.
+
+The object has a tool field and an args field:
+{"tool": "read_file", "args": {"path": "repo.py"}}
+
+The available tools are:
+${lines.join('\n')}
+
+After each tool result you get, answer with the next JSON object. When the task is
+finished, answer with the plain text DONE and nothing else.`;
 }
 
 /**
