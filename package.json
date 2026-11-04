@@ -1,0 +1,18 @@
+{
+  "name": "gemma4-agent-spend-cap",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Indirect prompt injection in coding agents and the cost of enforcing a hard spend cap. Harness for the Gemma 4 Developer Agent Paper Track.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test harness/",
+    "matrix": "node harness/run.js",
+    "chain": "node harness/chain.js"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
