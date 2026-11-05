@@ -206,7 +206,7 @@
   "modelWaits": 0,
   "modelWaitedMs": 0,
   "modelNetworkErrors": 0,
-  "durationMs": 172,
+  "durationMs": 173,
   "log": [
     {
       "kind": "tool_call",

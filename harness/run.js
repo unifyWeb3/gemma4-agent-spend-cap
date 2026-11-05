@@ -7,10 +7,10 @@
  *
  * Usage:
  *   node harness/run.js --tasks 6 --attacks all --defenses all --model stub
- *   node harness/run.js --model openrouter --tasks 12 --out results/runs-main
+ *   node harness/run.js --model google --tasks 12 --out results/runs-main
  */
 
-import { mkdirSync, writeFileSync, rmSync, existsSync, copyFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync, existsSync, copyFileSync, readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -20,7 +20,7 @@ const execFileAsync = promisify(execFile);
 
 import { ATTACKS, INJECTIONS, DRAIN_CALLS, DRAIN_AMOUNT, assessPayments, ATTACK_API } from './attacks.js';
 import { BUDGET_CENTS, AllowanceChain, experimentPolicy, makeHost, systemPrompt } from './defenses.js';
-import { OpenRouterModel, PollinationsModel, StubModel, makeTools, runAgent, toolProtocol } from './agent.js';
+import { GoogleModel, OpenRouterModel, PollinationsModel, StubModel, makeTools, runAgent, toolProtocol } from './agent.js';
 import { SOLUTIONS, TASKS, taskMarkdown } from './tasks.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -40,6 +40,8 @@ function parseArgs(argv) {
     out: 'results/runs',
     seed: 0,
     work: '/tmp/paper-runs',
+    concurrency: 1,
+    resume: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const key = argv[i];
@@ -52,8 +54,10 @@ function parseArgs(argv) {
       case '--out': args.out = value; i += 1; break;
       case '--work': args.work = value; i += 1; break;
       case '--seed': args.seed = Number(value); i += 1; break;
+      case '--concurrency': args.concurrency = Number(value); i += 1; break;
+      case '--resume': args.resume = true; break;
       case '--help':
-        console.log('usage: node harness/run.js [--tasks N] [--attacks all|a,b] [--defenses all|a,b] [--model stub|openrouter|pollinations] [--out DIR] [--work DIR]');
+        console.log('usage: node harness/run.js [--tasks N] [--attacks all|a,b] [--defenses all,a,b] [--model stub|google|openrouter|pollinations] [--out DIR] [--work DIR] [--concurrency N] [--resume]');
         process.exit(0);
         break;
       default: break;
@@ -230,7 +234,9 @@ async function runOne({ task, attack, defense, args, runId }) {
   });
 
   let model;
-  if (args.model === 'openrouter') {
+  if (args.model === 'google') {
+    model = new GoogleModel();
+  } else if (args.model === 'openrouter') {
     model = new OpenRouterModel();
   } else if (args.model === 'pollinations') {
     model = new PollinationsModel();
@@ -302,6 +308,30 @@ async function runOne({ task, attack, defense, args, runId }) {
   }
 
   return record;
+}
+
+/**
+ * Read every run record in a directory.
+ *
+ * The summary is built from the files on disk, not from the records this
+ * process happened to run, so a matrix split over several runs still gets one
+ * complete table.
+ *
+ * @param {string} dir
+ * @returns {object[]}
+ */
+export function readRecords(dir) {
+  if (!existsSync(dir)) return [];
+  const records = [];
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith('.json') || name === 'summary.json') continue;
+    try {
+      records.push(JSON.parse(readFileSync(join(dir, name), 'utf8')));
+    } catch {
+      // A half written file is skipped rather than crashing the summary.
+    }
+  }
+  return records;
 }
 
 /**
@@ -397,31 +427,66 @@ async function main() {
   mkdirSync(outDir, { recursive: true });
   mkdirSync(args.work, { recursive: true });
 
-  const records = [];
-  let count = 0;
-  const total = tasks.length * attacks.length * defenses.length;
+  // A run that already has a record is not repeated, so a matrix can be
+  // stopped and started again without paying for the same episode twice.
+  const cells = [];
   for (const task of tasks) {
     for (const attack of attacks) {
       for (const defense of defenses) {
-        count += 1;
         const runId = `${task.id}_${attack.id}_${defense}_${args.model}`;
-        process.stdout.write(`[${count}/${total}] ${runId}\n`);
-        const record = await runOne({ task, attack, defense, args, runId });
-        records.push(record);
-        writeFileSync(join(outDir, `${runId}.json`), JSON.stringify(record, null, 2));
+        const target = join(outDir, `${runId}.json`);
+        if (!args.resume || !existsSync(target)) {
+          cells.push({ task, attack, defense, runId, target });
+        }
       }
     }
   }
 
+  const total = cells.length;
+  let count = 0;
+
+  /**
+   * Run one cell and write its record.
+   *
+   * @param {object} cell
+   * @returns {Promise<object|null>}
+   */
+  async function runCell(cell) {
+    count += 1;
+    const label = `[${count}/${total}] ${cell.runId}`;
+    process.stdout.write(`${label}\n`);
+    const record = await runOne({ task: cell.task, attack: cell.attack, defense: cell.defense, args, runId: cell.runId });
+    writeFileSync(cell.target, JSON.stringify(record, null, 2));
+    return record;
+  }
+
+  if (args.concurrency > 1) {
+    const queue = [...cells];
+    const workers = Array.from({ length: Math.min(args.concurrency, queue.length) }, async () => {
+      while (queue.length > 0) {
+        const cell = queue.shift();
+        await runCell(cell);
+      }
+    });
+    await Promise.all(workers);
+  } else {
+    for (const cell of cells) {
+      await runCell(cell);
+    }
+  }
+
+  const records = readRecords(outDir);
   const summary = summarise(records);
   const meta = {
     model: args.model,
     modelId:
-      args.model === 'openrouter'
-        ? (process.env.OPENROUTER_MODEL ?? 'google/gemma-4-26b-a4b-it:free')
-        : args.model === 'pollinations'
-          ? (process.env.POLLINATIONS_MODEL ?? 'openai-fast')
-          : 'stub',
+      args.model === 'google'
+        ? (process.env.GEMINI_MODEL ?? 'gemma-4-26b-a4b-it')
+        : args.model === 'openrouter'
+          ? (process.env.OPENROUTER_MODEL ?? 'google/gemma-4-26b-a4b-it:free')
+          : args.model === 'pollinations'
+            ? (process.env.POLLINATIONS_MODEL ?? 'openai-fast')
+            : 'stub',
     budgetCents: BUDGET_CENTS,
     tasks: tasks.map((t) => t.id),
     attacks: attacks.map((a) => a.id),

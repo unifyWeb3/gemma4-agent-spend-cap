@@ -10,8 +10,9 @@
   },
   "scripts": {
     "test": "node --test harness/",
-    "matrix": "node harness/run.js",
-    "chain": "node harness/chain.js"
+    "matrix": "node --env-file-if-exists=.env harness/run.js",
+    "control": "node harness/run.js --tasks 12 --model stub --out results/control",
+    "gemma": "node --env-file-if-exists=.env harness/run.js --tasks 12 --model google --out results/gemma-ai-studio"
   },
   "dependencies": {},
   "devDependencies": {}

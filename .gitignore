@@ -6,3 +6,5 @@ results/runs/
 results/smoke*/
 results/probe*/
 results/pilot*/
+results/conc-test*/
+results/sig-test*/

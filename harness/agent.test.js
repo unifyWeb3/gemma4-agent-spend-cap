@@ -6,6 +6,7 @@ import { join } from 'node:path';
 
 import {
   ChatModel,
+  GoogleModel,
   OpenRouterModel,
   PollinationsModel,
   StubModel,
@@ -13,6 +14,7 @@ import {
   parseModelAction,
   parseNativeToolCall,
   runAgent,
+  stripThoughts,
   toApiTools,
   toolProtocol,
 } from './agent.js';
@@ -91,15 +93,118 @@ test('a 429 without a hint falls back to a minute', () => {
   assert.equal(ChatModel.retryAfterMs(res, ''), 60_000);
 });
 
-test('a plain server error is not retried', () => {
+test('a server error is retried, because the same request often works next time', () => {
   const res = { status: 500, headers: { get: () => null } };
-  assert.equal(ChatModel.retryAfterMs(res, 'internal error'), null);
+  assert.equal(ChatModel.retryAfterMs(res, 'internal error'), 5_000);
+});
+
+test('a client error is not retried', () => {
+  const res = { status: 400, headers: { get: () => null } };
+  assert.equal(ChatModel.retryAfterMs(res, 'bad request'), null);
 });
 
 test('the OpenRouter backend needs a key and the Pollinations backend does not', () => {
   assert.equal(new OpenRouterModel({ apiKey: null }).available, false);
   assert.equal(new OpenRouterModel({ apiKey: 'k' }).available, true);
   assert.equal(new PollinationsModel().available, true);
+});
+
+test('the Google backend needs a key and defaults to Gemma 4 26B', () => {
+  assert.equal(new GoogleModel({ apiKey: null }).available, false);
+  assert.equal(new GoogleModel({ apiKey: 'k' }).available, true);
+  assert.equal(new GoogleModel({ apiKey: 'k' }).model, 'gemma-4-26b-a4b-it');
+});
+
+test('the private reasoning block is removed from an answer', () => {
+  const text = '<thought>The user wants DONE.</thought>DONE';
+  assert.equal(stripThoughts(text), 'DONE');
+  assert.equal(stripThoughts('<thought>only reasoning</thought>'), '');
+  assert.equal(stripThoughts('plain answer'), 'plain answer');
+});
+
+test('a stray closing thought tag is removed too', () => {
+  assert.equal(stripThoughts('</thought></thought>DONE</thought>'), 'DONE');
+});
+
+test('the reasoning signature is kept so the model gets its own reasoning back', () => {
+  const parsed = parseNativeToolCall({
+    content: '',
+    tool_calls: [
+      {
+        id: 'call_1',
+        function: { name: 'read_file', arguments: '{"path":"repo.py"}' },
+        extra_content: { google: { thought_signature: 'sig-123' } },
+      },
+    ],
+  });
+  assert.deepEqual(parsed.toolCall.extraContent, { google: { thought_signature: 'sig-123' } });
+});
+
+test('a native tool call carries the raw arguments and the clean text', () => {
+  const parsed = parseNativeToolCall({
+    content: '<thought>call it</thought>',
+    tool_calls: [{ id: 'call_1', function: { name: 'read_file', arguments: '{"path":"repo.py"}' } }],
+  });
+  assert.equal(parsed.toolCall.tool, 'read_file');
+  assert.equal(parsed.toolCall.id, 'call_1');
+  assert.equal(parsed.toolCall.rawArguments, '{"path":"repo.py"}');
+  assert.equal(parsed.text, '');
+});
+
+test('the assistant turn that asked for a tool is kept in the history', async () => {
+  const workdir = mkdtempSync(join(tmpdir(), 'agent-history-'));
+  try {
+    const host = new PromptHost({
+      policy: makePolicy({ budget: 100 }),
+      state: makeState(0),
+      files: {},
+      onWrite: () => {},
+    });
+    const model = new StubModel({ solutions: {}, attackCalls: [], task: { id: 't01' } });
+    model.complete = async function complete() {
+      if (this.step >= 1) return { text: 'DONE' };
+      this.step += 1;
+      return {
+        toolCall: {
+          tool: 'read_file',
+          args: { path: 'repo.py' },
+          id: 'call_9',
+          rawArguments: '{"path":"repo.py"}',
+          extraContent: { google: { thought_signature: 'sig-9' } },
+        },
+      };
+    };
+    const result = await runAgent({
+      workdir,
+      host,
+      system: 'system',
+      model,
+      initialUserMessage: 'read the file',
+      tools: {
+        read_file: {
+          description: 'read',
+          parameters: { type: 'object', properties: {} },
+          async run() {
+            return { ok: true, content: 'x' };
+          },
+        },
+      },
+    });
+    const assistantTurn = result.transcript.find((m) => m.role === 'assistant' && m.tool_calls);
+    assert.ok(assistantTurn, 'the assistant turn with the tool call is in the history');
+    assert.equal(assistantTurn.tool_calls[0].id, 'call_9');
+    assert.equal(assistantTurn.tool_calls[0].function.name, 'read_file');
+    assert.deepEqual(
+      assistantTurn.tool_calls[0].extra_content,
+      { google: { thought_signature: 'sig-9' } },
+      'the reasoning signature is echoed back',
+    );
+    const toolTurn = result.transcript.find((m) => m.role === 'tool');
+    assert.ok(toolTurn, 'the tool result follows the assistant turn');
+    assert.equal(toolTurn.tool_call_id, 'call_9');
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test('a model that answers DONE stops the loop and keeps the receipts', async () => {
@@ -265,7 +370,7 @@ test('the task is given to the model as the first user message', async () => {
   }
 });
 
-test('a repeated identical call is refused instead of run twice', async () => {
+test('a repeated identical call still runs and carries a note that nothing changed', async () => {
   const workdir = mkdtempSync(join(tmpdir(), 'agent-loop-'));
   try {
     const host = new PromptHost({
@@ -279,7 +384,7 @@ test('a repeated identical call is refused instead of run twice', async () => {
       calls: 0,
       async complete() {
         this.calls += 1;
-        if (this.calls > 3) return { text: 'DONE' };
+        if (this.calls > 5) return { text: 'DONE' };
         return { toolCall: { tool: 'read_file', args: { path: 'repo.py' } } };
       },
     };
@@ -301,8 +406,13 @@ test('a repeated identical call is refused instead of run twice', async () => {
       },
     });
 
-    assert.equal(runs, 1, 'the tool should only run once');
-    assert.equal(result.log.filter((e) => e.kind === 'repeated_call').length, 2);
+    // The repeat still runs, so the model keeps its information, but the
+    // result carries a note that says the call changed nothing.
+    assert.equal(runs, 5, 'every repeat still runs');
+    assert.equal(result.log.filter((e) => e.kind === 'repeated_call').length, 1);
+    assert.equal(result.log.filter((e) => e.kind === 'repeated_call_allowed').length, 3);
+    const calls = result.log.filter((e) => e.kind === 'tool_call');
+    assert.match(calls.at(-1).result.note, /take a different step/);
   } finally {
     rmSync(workdir, { recursive: true, force: true });
   }
