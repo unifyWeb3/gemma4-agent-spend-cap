@@ -9,8 +9,11 @@ import {
   OpenRouterModel,
   PollinationsModel,
   StubModel,
+  normalizeArgs,
   parseModelAction,
+  parseNativeToolCall,
   runAgent,
+  toApiTools,
   toolProtocol,
 } from './agent.js';
 import { PromptHost } from './defenses.js';
@@ -128,8 +131,9 @@ test('a model that answers DONE stops the loop and keeps the receipts', async ()
     });
 
     assert.equal(result.done, true);
-    assert.equal(result.log.length, 1);
-    assert.equal(result.log[0].tool, 'unknown_tool');
+    const calls = result.log.filter((e) => e.kind === 'tool_call');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].tool, 'unknown_tool');
     assert.deepEqual(result.payments, []);
   } finally {
     rmSync(workdir, { recursive: true, force: true });
@@ -171,8 +175,177 @@ test('a tool that throws becomes a logged error and does not stop the run', asyn
     });
 
     assert.equal(result.done, true);
-    assert.equal(result.log.length, 1);
-    assert.match(result.log[0].result.error, /the tool broke/);
+    const calls = result.log.filter((e) => e.kind === 'tool_call');
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].result.error, /the tool broke/);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test('a native tool call is read out of the tool_calls array', () => {
+  const action = parseNativeToolCall({
+    content: '',
+    tool_calls: [{ id: 'call_1', function: { name: 'read_file', arguments: '{"path":"repo.py"}' } }],
+  });
+  assert.equal(action.toolCall.tool, 'read_file');
+  assert.deepEqual(action.toolCall.args, { path: 'repo.py' });
+  assert.equal(action.toolCall.id, 'call_1');
+});
+
+test('a message with no tool calls is not a tool call', () => {
+  assert.equal(parseNativeToolCall({ content: 'hello' }), null);
+  assert.equal(parseNativeToolCall({}), null);
+});
+
+test('the tool schemas are sent in the OpenAI function calling format', () => {
+  const tools = {
+    read_file: {
+      description: 'Read a file.',
+      parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+    },
+  };
+  const api = toApiTools(tools);
+  assert.equal(api.length, 1);
+  assert.equal(api[0].type, 'function');
+  assert.equal(api[0].function.name, 'read_file');
+  assert.deepEqual(api[0].function.parameters.required, ['path']);
+});
+
+test('arguments nested under args are flattened', () => {
+  assert.deepEqual(normalizeArgs({ args: { path: 'repo.py' } }), { path: 'repo.py' });
+});
+
+test('a tool name repeated inside the arguments is dropped', () => {
+  assert.deepEqual(normalizeArgs({ tool: 'write_file', path: 'repo.py', content: 'x' }), {
+    path: 'repo.py',
+    content: 'x',
+  });
+});
+
+test('arguments that are not an object become an empty object', () => {
+  assert.deepEqual(normalizeArgs(null), {});
+  assert.deepEqual(normalizeArgs('path=repo.py'), {});
+  assert.deepEqual(normalizeArgs([1, 2]), {});
+});
+
+test('the task is given to the model as the first user message', async () => {
+  const workdir = mkdtempSync(join(tmpdir(), 'agent-loop-'));
+  try {
+    const host = new PromptHost({
+      policy: makePolicy({ budget: 100 }),
+      state: makeState(0),
+      files: {},
+      onWrite: () => {},
+    });
+    let seen = null;
+    const model = {
+      calls: 0,
+      async complete({ messages }) {
+        this.calls += 1;
+        seen = messages;
+        return { text: 'DONE' };
+      },
+    };
+
+    const result = await runAgent({
+      workdir,
+      host,
+      system: 'system',
+      model,
+      tools: TOOLS,
+      initialUserMessage: '# Task\nfix the bug',
+    });
+
+    assert.equal(result.done, true);
+    assert.equal(seen[0].role, 'user');
+    assert.equal(seen[0].content, '# Task\nfix the bug');
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test('a repeated identical call is refused instead of run twice', async () => {
+  const workdir = mkdtempSync(join(tmpdir(), 'agent-loop-'));
+  try {
+    const host = new PromptHost({
+      policy: makePolicy({ budget: 100 }),
+      state: makeState(0),
+      files: {},
+      onWrite: () => {},
+    });
+    let runs = 0;
+    const model = {
+      calls: 0,
+      async complete() {
+        this.calls += 1;
+        if (this.calls > 3) return { text: 'DONE' };
+        return { toolCall: { tool: 'read_file', args: { path: 'repo.py' } } };
+      },
+    };
+
+    const result = await runAgent({
+      workdir,
+      host,
+      system: 'system',
+      model,
+      tools: {
+        read_file: {
+          description: 'Read a file.',
+          parameters: { type: 'object', properties: { path: { type: 'string' } } },
+          run: async () => {
+            runs += 1;
+            return { ok: true };
+          },
+        },
+      },
+    });
+
+    assert.equal(runs, 1, 'the tool should only run once');
+    assert.equal(result.log.filter((e) => e.kind === 'repeated_call').length, 2);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test('repeated paid calls are not guarded, because a run of them is the drain attack', async () => {
+  const workdir = mkdtempSync(join(tmpdir(), 'agent-loop-'));
+  try {
+    const host = new PromptHost({
+      policy: makePolicy({ budget: 100 }),
+      state: makeState(0),
+      files: {},
+      onWrite: () => {},
+    });
+    let runs = 0;
+    const model = {
+      calls: 0,
+      async complete() {
+        this.calls += 1;
+        if (this.calls > 3) return { text: 'DONE' };
+        return { toolCall: { tool: 'call_paid_api', args: { vendor: 'v.testnet', amount: 2 } } };
+      },
+    };
+
+    const result = await runAgent({
+      workdir,
+      host,
+      system: 'system',
+      model,
+      tools: {
+        call_paid_api: {
+          description: 'Call a paid API service.',
+          parameters: { type: 'object', properties: { vendor: { type: 'string' }, amount: { type: 'number' } } },
+          run: async () => {
+            runs += 1;
+            return { ok: true };
+          },
+        },
+      },
+    });
+
+    assert.equal(runs, 3, 'every paid call should run');
+    assert.equal(result.log.filter((e) => e.kind === 'repeated_call').length, 0);
   } finally {
     rmSync(workdir, { recursive: true, force: true });
   }

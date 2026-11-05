@@ -3,3 +3,6 @@ results/*.json
 results/runs/
 .env
 *.log
+results/smoke*/
+results/probe*/
+results/pilot*/
