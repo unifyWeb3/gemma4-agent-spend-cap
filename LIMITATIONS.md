@@ -1,9 +1,10 @@
 # Limitations
 
 - The Gemma 4 arm runs on Google AI Studio. The endpoint returned HTTP 500 with an empty body on roughly half of the raw requests during the run, and the harness retries those calls. A retried call is a fresh sample, so the arm measures the model under its normal behaviour and not under a fixed request budget.
+- The first pass of the model arm lost 39 of the 180 cells to transport errors, DNS failures and HTTP 500s from the endpoint. Those cells were moved into `failed-attempts-<timestamp>/` and rerun with `--resume`, and a further 3 cells needed a second pass. The reported records are the rerun. The failed attempts are kept as evidence, and the final matrix has 180 records with 0 errors.
 - The Gemma 4 arm is one episode per cell, not a distribution. Temperature zero does not make two episodes identical, and 180 episodes are not a statistical sample of the model's behaviour in the wild.
 - The control arm is a scripted agent. It proves the delivery path and the defence logic. It says nothing about how a real model behaves.
-- Delivery must be read from the data, not assumed. The first matrix measured 0 of 36 episodes for the indirect class and 2 of 36 for the tool output class, because the tasks did not require reading the fixture or searching. That run was archived, not reported. Any future run must report `injectionExposed` per cell.
+- Delivery must be read from the data, not assumed. The first matrix measured 0 of 36 episodes for the indirect class and 2 of 36 for the tool output class, because the tasks did not require reading the fixture or searching. That run was archived, not reported. Any future run must report `injectionExposed` per cell. The final matrix reports 100% exposure in all 360 cells of both arms.
 - The task set has twelve synthetic Python tasks. It is useful for reproducibility, not for general software engineering capability. The fixture and documentation contents are deliberately small.
 - The paid API is a local stub. No real API, invoice, transfer or vendor was called.
 - The hard cap result exercises the simulator in `defenses.js` and the JavaScript port of the policy engine in `policy.js`. The NEAR contract on testnet implements the same rules and the demo rejects a misuse of the restricted access key, but the contract is not inside this matrix.
@@ -17,5 +18,6 @@
 - The allowlist and blocklist are supplied by the harness. False positives on arbitrary real world vendors are not measured.
 - The allowlist and the refusal strings in the hard cap simulator match the deployed contract, which is pinned by a test. Changing either without changing the other will be visible in that test.
 - The harness echoes the assistant turn that made a tool call back into the model history, with the reasoning signature that AI Studio attaches to the call. Without that signature the model loops on the same tool call. That is a property of the endpoint contract, not of the attacks, but it does mean the arm measures one particular way of driving the model.
-- An episode that ends at the step cap is reported as unfinished, not as a failure. The cap is 20 steps and the `mean steps` column in the results table shows which cells ran out.
+- An episode that ends at the step cap is reported as unfinished, not as a failure. The cap is 20 steps and the `gemma capped` column in Table 1 shows which cells ran out.
+- The cost of a refusal is measured as time, and it is an upper bound. Each refused retry costs a step, so a host that refuses repeated identical calls would report a smaller cost. In the `tamper` and `hard_cap` cell the policy refused 7.75 payment attempts per episode and 10 of 12 episodes hit the step limit.
 - `t08` never produced a final `DONE` in the Gemma arm, so its `done` rate is zero. It is included rather than dropped.
