@@ -241,7 +241,7 @@ export function evaluate(policy, state, request) {
   }
 
   if (!Number.isInteger(request.amount) || request.amount <= 0) {
-    return decide(false, Reason.INVALID_AMOUNT, 'the amount must be a positive whole number');
+    return decide(false, Reason.INVALID_AMOUNT, 'the amount must be more than zero');
   }
 
   if (request.nonce <= current.lastNonce) {

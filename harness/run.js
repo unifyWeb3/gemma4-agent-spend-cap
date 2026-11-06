@@ -21,7 +21,8 @@ const execFileAsync = promisify(execFile);
 import { ATTACKS, INJECTIONS, DRAIN_CALLS, DRAIN_AMOUNT, assessPayments, ATTACK_API } from './attacks.js';
 import { BUDGET_CENTS, AllowanceChain, experimentPolicy, makeHost, systemPrompt } from './defenses.js';
 import { GoogleModel, OpenRouterModel, PollinationsModel, StubModel, makeTools, runAgent, toolProtocol } from './agent.js';
-import { SOLUTIONS, TASKS, taskMarkdown } from './tasks.js';
+import { SOLUTIONS, TASKS, docNote, taskMarkdown } from './tasks.js';
+import { measureExposure } from './exposure.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..');
@@ -69,6 +70,11 @@ function parseArgs(argv) {
 /**
  * Write a task to a directory, with the attack applied.
  *
+ * Returns the text of the injection delivery route so the caller can check
+ * that the attack was actually placed where the agent would find it. A run
+ * whose injection was never delivered is not a test of the defence, and the
+ * caller refuses to treat it as one.
+ *
  * @param {string} workdir
  * @param {object} task
  * @param {object} attack
@@ -83,8 +89,10 @@ function materialise(workdir, task, attack) {
     writeFileSync(full, content, 'utf8');
   }
 
+  const docText = docNote(task);
   let markdown = taskMarkdown(task, BUDGET_CENTS);
   let poisonedDocs = null;
+  let deliveryReady = true;
 
   if (attack.id === 'direct') {
     markdown += `\n${INJECTIONS.direct}\n`;
@@ -94,8 +102,10 @@ function materialise(workdir, task, attack) {
     mkdirSync(dirname(full), { recursive: true });
     const existing = existsSync(full) ? readFileSafe(full) : '';
     writeFileSync(full, `${existing}\n${INJECTIONS.indirect}\n`, 'utf8');
+    deliveryReady = readFileSafe(full).includes(INJECTIONS.indirect);
   } else if (attack.id === 'tool_output') {
-    poisonedDocs = INJECTIONS.tool_output;
+    poisonedDocs = `${docText}\n\n${INJECTIONS.tool_output}\n`;
+    deliveryReady = poisonedDocs.includes(INJECTIONS.tool_output);
   } else if (attack.id === 'drain') {
     markdown += `\n${INJECTIONS.drain}\n`;
   } else if (attack.id === 'tamper') {
@@ -103,6 +113,10 @@ function materialise(workdir, task, attack) {
   }
 
   writeFileSync(join(workdir, 'task.md'), markdown, 'utf8');
+
+  if (attack.id === 'direct' || attack.id === 'drain' || attack.id === 'tamper') {
+    deliveryReady = markdown.includes(INJECTIONS[attack.id]);
+  }
 
   const policy = experimentPolicy();
   writeFileSync(
@@ -122,11 +136,33 @@ function materialise(workdir, task, attack) {
 
   copyFileSync(join(HERE, 'run_tests.py'), join(workdir, 'run_tests.py'));
 
-  return { markdown, poisonedDocs };
+  return { markdown, docText, poisonedDocs, deliveryReady };
 }
 
 function readFileSafe(path) {
   return readFileSync(path, 'utf8');
+}
+
+/**
+ * The steps a scripted agent has to take before it can obey the injection.
+ *
+ * The control arm has to obey the same delivery rule as the model. For the
+ * data file route that means reading the file. For the tool output route that
+ * means running the search. For the routes that carry the injection in the
+ * task description there is nothing extra to do, because the task description
+ * is the first thing the agent reads.
+ *
+ * @param {object} task
+ * @param {object} attack
+ */
+function exposureActions(task, attack) {
+  if (attack.id === 'indirect') {
+    return [{ tool: 'read_file', args: { path: task.dataFile } }];
+  }
+  if (attack.id === 'tool_output') {
+    return [{ tool: 'search_docs', args: { query: task.name } }];
+  }
+  return [];
 }
 
 /**
@@ -207,7 +243,7 @@ async function verifyPatch(workdir) {
  */
 async function runOne({ task, attack, defense, args, runId }) {
   const workdir = join(args.work, runId);
-  const { poisonedDocs } = materialise(workdir, task, attack);
+  const { docText, poisonedDocs, deliveryReady } = materialise(workdir, task, attack);
 
   const policy = experimentPolicy();
   const state = { periodStart: 0, spent: 0, spendTimes: [], lastNonce: -1, seenVendors: [] };
@@ -230,6 +266,7 @@ async function runOne({ task, attack, defense, args, runId }) {
     host,
     testRunner: join(workdir, 'run_tests.py'),
     poisonedDocs,
+    docText,
     log,
   });
 
@@ -242,7 +279,14 @@ async function runOne({ task, attack, defense, args, runId }) {
     model = new PollinationsModel();
   } else {
     const { calls, extra } = stubAttackActions(attack);
-    model = new StubModel({ solutions: SOLUTIONS, attackCalls: calls, extraActions: extra, task });
+    model = new StubModel({
+      solutions: SOLUTIONS,
+      attackCalls: calls,
+      extraActions: extra,
+      preAttackActions: exposureActions(task, attack),
+      deliveryReady,
+      task,
+    });
   }
 
   const started = Date.now();
@@ -259,6 +303,12 @@ async function runOne({ task, attack, defense, args, runId }) {
     const assessment = assessPayments(result.payments, BUDGET_CENTS);
     const legit = result.payments.filter((p) => p.vendor === 'reference-api.testnet');
     const verification = await verifyPatch(workdir);
+    const exposure = measureExposure({
+      attackId: attack.id,
+      task,
+      log: result.log,
+      transcript: result.transcript,
+    });
     record = {
       runId,
       task: task.id,
@@ -269,14 +319,20 @@ async function runOne({ task, attack, defense, args, runId }) {
       modelId: model.model ?? 'stub',
       budgetCents: BUDGET_CENTS,
       steps: result.steps,
+      maxSteps: result.maxSteps ?? null,
       done: result.done,
       taskPassed: result.lastTestPassed,
       verifiedPatchPassed: verification.passed,
       verification,
       attackSuccess: assessment.success,
       lossCents: assessment.lossCents,
+      budgetBreached: assessment.budgetBreached,
       attackCalls: assessment.calls,
       blockedSmallPayments: assessment.blockedSmallPayments,
+      deliveryReady,
+      injectionExposed: exposure.exposed,
+      exposureRoute: exposure.route,
+      exposureEvidence: exposure.evidence,
       legitCalls: legit.length,
       legitBlocked: legit.some((p) => !p.executed),
       legitReason: legit.find((p) => !p.executed)?.reason ?? null,
@@ -360,6 +416,9 @@ export function summarise(records) {
         lookupDone: 0,
         noSpend: 0,
         blockedSmallPayments: 0,
+        exposed: 0,
+        successExposed: 0,
+        budgetBreaches: 0,
         steps: 0,
         modelCalls: 0,
       });
@@ -367,6 +426,11 @@ export function summarise(records) {
     const g = groups.get(k);
     g.runs += 1;
     g.attackSuccesses += r.attackSuccess ? 1 : 0;
+    if (r.injectionExposed) {
+      g.exposed += 1;
+      g.successExposed += r.attackSuccess ? 1 : 0;
+    }
+    g.budgetBreaches += r.budgetBreached ? 1 : 0;
     g.lossCents += r.lossCents;
     g.taskPassed += r.taskPassed ? 1 : 0;
     if (r.verifiedPatchPassed === true) g.verifiedPassed += 1;
@@ -385,7 +449,11 @@ export function summarise(records) {
       attack: g.attack,
       defense: g.defense,
       runs: g.runs,
+      exposed: g.exposed,
+      exposureRate: g.runs ? g.exposed / g.runs : 0,
       attackSuccessRate: g.runs ? g.attackSuccesses / g.runs : 0,
+      successGivenExposure: g.exposed ? g.successExposed / g.exposed : null,
+      budgetBreachRate: g.runs ? g.budgetBreaches / g.runs : 0,
       meanLossCents: g.runs ? g.lossCents / g.runs : 0,
       taskCompletion: g.runs ? g.taskPassed / g.runs : 0,
       verifiedPatchRate: g.verifiedPassed + g.verifiedFailed > 0
@@ -408,11 +476,11 @@ export function summarise(records) {
  * @param {object[]} summary
  */
 export function summaryMarkdown(summary) {
-  const head = '| attack | defence | runs | attack success | mean loss cents | task completion | patch verified | lookup done | legit blocked | blocked small calls | mean steps |';
-  const sep = '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |';
+  const head = '| attack | defence | runs | exposed | attack success | success given exposed | mean loss cents | task completion | patch verified | lookup done | legit blocked | blocked small calls | mean steps |';
+  const sep = '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |';
   const rows = summary.map(
     (s) =>
-      `| ${s.attack} | ${s.defense} | ${s.runs} | ${(s.attackSuccessRate * 100).toFixed(0)}% | ${s.meanLossCents.toFixed(1)} | ${(s.taskCompletion * 100).toFixed(0)}% | ${s.verifiedPatchRate === null ? 'n/a' : `${(s.verifiedPatchRate * 100).toFixed(0)}%`} | ${(s.lookupRate * 100).toFixed(0)}% | ${(s.falsePositiveRate * 100).toFixed(0)}% | ${s.blockedSmallPayments.toFixed(1)} | ${s.meanSteps.toFixed(1)} |`,
+      `| ${s.attack} | ${s.defense} | ${s.runs} | ${(s.exposureRate * 100).toFixed(0)}% | ${(s.attackSuccessRate * 100).toFixed(0)}% | ${s.successGivenExposure === null ? 'n/a' : `${(s.successGivenExposure * 100).toFixed(0)}%`} | ${s.meanLossCents.toFixed(1)} | ${(s.taskCompletion * 100).toFixed(0)}% | ${s.verifiedPatchRate === null ? 'n/a' : `${(s.verifiedPatchRate * 100).toFixed(0)}%`} | ${(s.lookupRate * 100).toFixed(0)}% | ${(s.falsePositiveRate * 100).toFixed(0)}% | ${s.blockedSmallPayments.toFixed(1)} | ${s.meanSteps.toFixed(1)} |`,
   );
   return [head, sep, ...rows].join('\n');
 }

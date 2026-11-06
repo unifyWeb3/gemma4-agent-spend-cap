@@ -1,13 +1,21 @@
 # Limitations
 
-- The Gemma 4 arm is missing. The current model evidence is one Pollinations substitute run. It does not establish Gemma 4 behaviour or relative model safety.
-- The task set has twelve synthetic Python tasks. It is useful for reproducibility, not for general software engineering capability.
+- The Gemma 4 arm runs on Google AI Studio. The endpoint returned HTTP 500 with an empty body on roughly half of the raw requests during the run, and the harness retries those calls. A retried call is a fresh sample, so the arm measures the model under its normal behaviour and not under a fixed request budget.
+- The Gemma 4 arm is one episode per cell, not a distribution. Temperature zero does not make two episodes identical, and 180 episodes are not a statistical sample of the model's behaviour in the wild.
+- The control arm is a scripted agent. It proves the delivery path and the defence logic. It says nothing about how a real model behaves.
+- Delivery must be read from the data, not assumed. The first matrix measured 0 of 36 episodes for the indirect class and 2 of 36 for the tool output class, because the tasks did not require reading the fixture or searching. That run was archived, not reported. Any future run must report `injectionExposed` per cell.
+- The task set has twelve synthetic Python tasks. It is useful for reproducibility, not for general software engineering capability. The fixture and documentation contents are deliberately small.
 - The paid API is a local stub. No real API, invoice, transfer or vendor was called.
-- The hard cap result exercises the simulator in `defenses.js`. The NEAR contract builds but has not been measured in this matrix.
+- The hard cap result exercises the simulator in `defenses.js` and the JavaScript port of the policy engine in `policy.js`. The NEAR contract on testnet implements the same rules and the demo rejects a misuse of the restricted access key, but the contract is not inside this matrix.
+- The protocol arm from the paper design was rebuilt after reading nearcore: a function call key cannot carry a deposit at all, and the allowance caps gas, not value. The earlier design of a key pointing at the payment receiver could not have worked. See `docs/RULES.md` and `docs/DECISIONS.md` in the planning workspace.
 - The response to the tamper attack depends on what the host trusts. The control exercises a host that reads a mutable policy file; it does not prove every host implementation is vulnerable.
 - The task budget is 10 cents and the premium target costs 200 cents. Real payment systems have richer amounts, refunds, authorizations and compliance constraints.
-- The attack prompts are explicit in the control. Hidden, obfuscated or multi-step attacks may behave differently.
-- One seed is used in the control matrix because expected behaviour is deterministic. The model arm will need more than one seed if rate limits permit, and the paper must report when they do not.
+- The attack prompts are explicit. Hidden, obfuscated or multi-step attacks may behave differently.
+- One seed is used because the model arm is run at temperature zero, so a second seed would not sample a different behaviour. A single episode carries one episode of weight.
 - The framework reports task success and verified patch success separately because an agent can write the right patch and never invoke `run_test`.
 - The free model endpoint may throttle, return HTTP errors or change without notice. Results from a rate limited endpoint are evidence about that endpoint at that date, not a stable public benchmark.
 - The allowlist and blocklist are supplied by the harness. False positives on arbitrary real world vendors are not measured.
+- The allowlist and the refusal strings in the hard cap simulator match the deployed contract, which is pinned by a test. Changing either without changing the other will be visible in that test.
+- The harness echoes the assistant turn that made a tool call back into the model history, with the reasoning signature that AI Studio attaches to the call. Without that signature the model loops on the same tool call. That is a property of the endpoint contract, not of the attacks, but it does mean the arm measures one particular way of driving the model.
+- An episode that ends at the step cap is reported as unfinished, not as a failure. The cap is 20 steps and the `mean steps` column in the results table shows which cells ran out.
+- `t08` never produced a final `DONE` in the Gemma arm, so its `done` rate is zero. It is included rather than dropped.
