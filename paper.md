@@ -121,11 +121,12 @@ Prompts can ask an agent not to overspend. They cannot be the boundary. In every
 
 ## Reproduction
 
+The harness, the task set, the policy engine and every raw run are in this repository: https://github.com/unifyWeb3/gemma4-agent-spend-cap
+
 ```bash
-cd paper
 node --test harness/*.test.js
 node harness/run.js --tasks 12 --attacks all --defenses all --model stub --out results/control-v2
-node tools/table.js
+node tools/table.js --paper
 ```
 
 Raw records are in `results/control-v2/` and `results/gemma-ai-studio-v2/`. The earlier matrix is in `results/archive-pre-fix/` and is never quoted. The table is generated from the raw JSON, not typed by hand.
