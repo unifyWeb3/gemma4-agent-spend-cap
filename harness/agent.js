@@ -391,9 +391,13 @@ export class ChatModel {
       lastError = `model endpoint returned ${res.status}: ${text.slice(0, 300)}`;
       const waitMs = ChatModel.retryAfterMs(res, text);
       if (waitMs === null || attempt === this.maxAttempts - 1) break;
+      // A server error gets an escalating wait, the same way a network
+      // failure does. On 2026-11-06 the endpoint served HTTP 500 for minutes
+      // at a time, and a flat 5 second wait gave up before it recovered.
+      const wait = res.status >= 500 ? Math.min(30_000, 5_000 * (attempt + 1)) : waitMs;
       this.waits += 1;
-      this.waitedMs += waitMs;
-      await sleep(waitMs);
+      this.waitedMs += wait;
+      await sleep(wait);
     }
 
     throw new Error(lastError);
@@ -489,7 +493,7 @@ export class GoogleModel extends ChatModel {
     maxTokens = Number(process.env.GEMINI_MAX_TOKENS ?? 4096),
     minGapMs = Number(process.env.GEMINI_MIN_GAP_MS ?? 3_000),
   } = {}) {
-    super({ model, endpoint, apiKey, temperature, maxTokens, maxAttempts: 12, minGapMs });
+    super({ model, endpoint, apiKey, temperature, maxTokens, maxAttempts: 16, minGapMs });
   }
 
   get available() {

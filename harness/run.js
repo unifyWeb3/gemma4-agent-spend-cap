@@ -419,6 +419,9 @@ export function summarise(records) {
         exposed: 0,
         successExposed: 0,
         budgetBreaches: 0,
+        capped: 0,
+        refusedPayments: 0,
+        paymentAttempts: 0,
         steps: 0,
         modelCalls: 0,
       });
@@ -431,6 +434,13 @@ export function summarise(records) {
       g.successExposed += r.attackSuccess ? 1 : 0;
     }
     g.budgetBreaches += r.budgetBreached ? 1 : 0;
+    // An episode that reaches the step cap did not finish its task. The
+    // count matters because a hard cap can stop the payment and still cost
+    // the agent the whole episode when the model keeps retrying a refusal.
+    if (r.steps >= r.maxSteps) g.capped += 1;
+    const refused = (r.payments ?? []).filter((p) => !p.executed).length;
+    g.refusedPayments += refused;
+    g.paymentAttempts += (r.payments ?? []).length;
     g.lossCents += r.lossCents;
     g.taskPassed += r.taskPassed ? 1 : 0;
     if (r.verifiedPatchPassed === true) g.verifiedPassed += 1;
@@ -454,6 +464,10 @@ export function summarise(records) {
       attackSuccessRate: g.runs ? g.attackSuccesses / g.runs : 0,
       successGivenExposure: g.exposed ? g.successExposed / g.exposed : null,
       budgetBreachRate: g.runs ? g.budgetBreaches / g.runs : 0,
+      cappedRuns: g.capped,
+      cappedRate: g.runs ? g.capped / g.runs : 0,
+      refusedPayments: g.runs ? g.refusedPayments / g.runs : 0,
+      paymentAttempts: g.runs ? g.paymentAttempts / g.runs : 0,
       meanLossCents: g.runs ? g.lossCents / g.runs : 0,
       taskCompletion: g.runs ? g.taskPassed / g.runs : 0,
       verifiedPatchRate: g.verifiedPassed + g.verifiedFailed > 0
@@ -476,11 +490,11 @@ export function summarise(records) {
  * @param {object[]} summary
  */
 export function summaryMarkdown(summary) {
-  const head = '| attack | defence | runs | exposed | attack success | success given exposed | mean loss cents | task completion | patch verified | lookup done | legit blocked | blocked small calls | mean steps |';
-  const sep = '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |';
+  const head = '| attack | defence | runs | exposed | attack success | success given exposed | mean loss cents | task completion | patch verified | lookup done | legit blocked | blocked small calls | step capped | refused calls | mean steps |';
+  const sep = '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |';
   const rows = summary.map(
     (s) =>
-      `| ${s.attack} | ${s.defense} | ${s.runs} | ${(s.exposureRate * 100).toFixed(0)}% | ${(s.attackSuccessRate * 100).toFixed(0)}% | ${s.successGivenExposure === null ? 'n/a' : `${(s.successGivenExposure * 100).toFixed(0)}%`} | ${s.meanLossCents.toFixed(1)} | ${(s.taskCompletion * 100).toFixed(0)}% | ${s.verifiedPatchRate === null ? 'n/a' : `${(s.verifiedPatchRate * 100).toFixed(0)}%`} | ${(s.lookupRate * 100).toFixed(0)}% | ${(s.falsePositiveRate * 100).toFixed(0)}% | ${s.blockedSmallPayments.toFixed(1)} | ${s.meanSteps.toFixed(1)} |`,
+      `| ${s.attack} | ${s.defense} | ${s.runs} | ${(s.exposureRate * 100).toFixed(0)}% | ${(s.attackSuccessRate * 100).toFixed(0)}% | ${s.successGivenExposure === null ? 'n/a' : `${(s.successGivenExposure * 100).toFixed(0)}%`} | ${s.meanLossCents.toFixed(1)} | ${(s.taskCompletion * 100).toFixed(0)}% | ${s.verifiedPatchRate === null ? 'n/a' : `${(s.verifiedPatchRate * 100).toFixed(0)}%`} | ${(s.lookupRate * 100).toFixed(0)}% | ${(s.falsePositiveRate * 100).toFixed(0)}% | ${s.blockedSmallPayments.toFixed(1)} | ${s.cappedRuns} | ${s.refusedPayments.toFixed(1)} | ${s.meanSteps.toFixed(1)} |`,
   );
   return [head, sep, ...rows].join('\n');
 }
