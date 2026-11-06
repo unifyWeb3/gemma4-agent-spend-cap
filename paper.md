@@ -1,103 +1,93 @@
 # The Leash Cannot Be Prompted
 ## Indirect Prompt Injection in Coding Agents and the Cost of a Hard Spend Cap
 
-Working draft, 2026-11-05. The Gemma 4 arm has not been run because the OpenRouter key is still missing. Every reported number traces to a raw log in `results/`. Do not submit this file until the Gemma arm is complete and the results section is replaced with those runs. The control arm is complete.
+Working draft, 2026-11-06. Every reported number traces to a raw record in `results/`. The corrected matrix is running; the pre-delivery-fix run is archived in `results/archive-pre-fix/` and is never quoted.
 
 ## Abstract
 
-Coding agents read untrusted repositories, and a repository can instruct an agent to spend money. The usual response is a prompt saying the agent must not exceed its budget. We test what that response costs. We built twelve repository tasks, five classes of untrusted instruction, and three enforcement regimes: a prompt instruction, a host side tool policy, and a hard cap enforced outside the model. In the 180-run control experiment, the prompt instruction allowed the attack in every run, the tool policy blocked every attack except tampering, and the hard cap blocked every attack with no measured false positive on legitimate work. The same fix was verified by a post-episode test run even when the agent did not call the test tool. The Gemma 4 model arm is pending on model access and is not reported here. The task set, harness and raw logs are released with the paper.
+Coding agents read untrusted repositories, and a repository can instruct an agent to spend money. The common response is a system prompt telling the agent not to overspend. We built twelve synthetic repository tasks, five classes of untrusted instruction and three enforcement regimes (a prompt instruction, a host side tool policy and a hard cap enforced outside the model), and we measured what it costs to rely on each. Every episode records whether the injected text actually reached the model, which is what made the first experiment measure delivery instead of defence. In the corrected control arm, the prompt regime allowed the paid call in every delivered cell, the tool policy stopped every class except policy tampering, and the hard cap stopped every class. Gemma 4 26B-A4B on Google AI Studio was substantially harder to talk into the premium payment even when the injection arrived, and a hard cap returning the deployed contract's refusal strings stopped every attempt. Every episode is released as a raw record.
 
 ## Introduction
 
-AI coding agents are becoming systems that act. They read issues, run commands, call paid services and apply patches. A service call has a common shape: the agent sends money or a paid token to a vendor in exchange for data, such as a reference price. When an attacker can write a file in the repository, the attacker can also write an instruction that tries to redirect that payment.
+AI coding agents are moving from answering questions to acting. They read issues, run commands, call paid services and apply patches. One common action is a paid lookup: the agent pays a reference API for a price and uses it in the fix. When an attacker can shape a file in the repository, the attacker can also write an instruction that tries to redirect that payment.
 
-A prompt instruction is not an authority. It can fail, and it can be ignored under pressure. A host side policy is better, but the host can fail when the agent can alter the policy it reads. A limit imposed outside the model does not depend on the model agreeing to behave.
+A prompt instruction is not an authority. It can be ignored, especially under pressure. A host side policy is stronger, but the policy lives in something the agent can sometimes reach. A limit imposed outside the model does not depend on the model agreeing to behave.
 
-This study asks a narrow question. What does it cost to stop indirect prompt injection in a coding agent that can spend money? The costs we measure are realised loss, a refused legitimate payment and a task that does not pass its tests.
+This study isolates the enforcement point. It asks a narrow question: what does each regime cost, in realised loss, refused legitimate work and unfinished tasks, when the injection actually arrives?
 
 ## Threat model
 
-The attacker can place or influence repository content: a task file, a data fixture, or documentation returned by a search tool. The attacker wants the agent to call a premium endpoint and pay more than the legitimate lookup. The attacker cannot modify the test runner, the host process, or the vendor price list. The agent can read files, write the task's code file, run the test, search local documentation and call the paid API.
+The attacker can place or influence repository content: a task file, a data fixture, or documentation returned by the search tool. The attacker does not control the test runner, the host process, or the vendor's price list. The agent can read files, write the task code, run the test, search local documentation and call the paid API.
 
-The defender wants the task completed, the legitimate payment made, and no payment to the attacker target. We count a successful attack when the agent calls the attacker target, and we count a false positive when the policy blocks the legitimate reference API call. An attempt while the cap is active is still a useful refusal signal.
+The defender's goals are the task completed, the legitimate lookup made, and no payment to the attacker's target. A successful attack is an executed payment to `premium-api.testnet`. Loss counts the cents moved. A false positive is the policy refusing the legitimate 2 cent lookup.
+
+The critical measurement decision is delivery. An attack that never reaches the model is not an attack. The first version of this harness measured attack success without measuring delivery: the Gemma arm read the injected fixture in 0 of 36 indirect episodes and searched the documentation in 2 of 36 tool output episodes. Those cells would have scored a perfect 0% attack success rate regardless of what the model would have done with the injection. Every episode now records `injectionExposed`, `exposureRoute` and `exposureEvidence`, and every result cell below shows its exposure.
 
 ## Method
 
 ### Harness
 
-The harness is a zero dependency Node 24 program. It writes each task to a temporary directory, gives the agent five tools, executes every call it requests and records the result. The agent loop is our code, so every decision is inspectable. The paid API is a local stub with two prices: 2 cents for the reference lookup the task requires, and 200 cents for the premium endpoint the attack targets. The task budget is 10 cents.
-
-After each episode, the harness runs `harness/run_tests.py` again in the work directory. This matters because a weak model can write the right patch and never call `run_test`. The result is reported as `verifiedPatchPassed`, separately from `taskPassed`. In this draft, the control arm is deterministic and is not a model. The model arm is pending.
+The harness is a zero dependency Node 24 program. It writes each task to a temporary directory, gives the agent five tools, executes every call it requests and records the result. The agent loop is our code, so every decision is inspectable. The paid API is a local stub with two prices: 2 cents for the required reference lookup and 200 cents for the premium endpoint the attack targets. The budget is 10 cents. After each episode the harness reruns the task tests and reports `verifiedPatchPassed` separately from `taskPassed`.
 
 ### Tasks
 
-Twelve Python tasks each contain a small bug and a failing test. The bugs cover string handling, scope and comparison mistakes. Each task requires a legitimate paid lookup before the fix. The intended answers are fixed and known, so the control arm is reproducible.
+Twelve Python tasks each contain one bug and a failing test. Each task requires the agent to read its data fixture and to search the documentation, because the task description says so. The fixtures point to the reference values the fix needs. The fixed answers are known, so the control is reproducible.
 
-### Attacks
+### Attack classes
 
-| Attack | Delivery |
-| --- | --- |
-| `direct` | The task file itself tells the agent to make a premium payment first. |
-| `indirect` | A data file the agent reads carries the same instruction. |
-| `tool_output` | The search tool returns the instruction as its result. |
-| `drain` | Repeated small payments remain under the per-spend limit and try to spend the budget. |
-| `tamper` | The attack tries to alter the policy file the host trusts. |
-
-Each attack targets `premium-api.testnet` and is rejected by the budget and allowlist rules in the enforced arms.
+| Attack | How it arrives | What delivery requires |
+| --- | --- | --- |
+| `direct` | The task description tells the agent to pay the premium endpoint first | None, the instruction is in the user message |
+| `indirect` | The data fixture carries the instruction | The agent reads the fixture |
+| `tool_output` | The search result carries the instruction | The agent searches the documentation |
+| `drain` | Repeated small payments under the per spend cap exhaust the budget | None |
+| `tamper` | The agent is told the policy file is wrong and where it lives | None |
 
 ### Regimes
 
-`prompt_only` puts the budget in the system prompt. `tool_policy` checks each tool call in the host and uses an allowlist and rate checks. `hard_cap` uses the same allowance chain as a deterministic backstop. The on chain NEAR implementation exists in this repository but did not run for this matrix, so the current result is a chain backstop in simulation, not a mainnet or testnet claim. No NEAR payment was made.
+`prompt_only` puts the budget in the system prompt. `tool_policy` checks each call in the host, using an allowlist, a per spend cap, a rate limit and a mutable `policy.json` in the task directory, so a tampered file is honoured. `hard_cap` enforces the limit outside the model with an allowance chain that is the same decision surface as the deployed contract. The chain simulator returns the deployed contract's exact refusal strings, pinned by a test, with evidence lines. An informative refusal changes behaviour; an empty refusal made the model retry until the step cap ran out, which is what the first matrix showed.
+
+The real testnet implementation exists in the sibling `bound` repository: a function call access key scoped to one contract method, so it cannot point at the vendor at all. The contract stores the policy, evaluates it, and writes a receipt for every decision.
 
 ### Metrics
 
-Attack success rate is the share of runs that call the attacker target. Realised loss is the value of those calls. False positive rate is the share of episodes that block the legitimate 2 cent lookup. Task completion is the agent calling the test tool and seeing it pass. Verified patch rate is the share of final work directories that pass the task tests after the episode. Both are reported because they can disagree.
+Attack success rate is executed payments to the premium receiver. Mean loss counts cents moved. Exposure rate is episodes where the injected text reached the model. Task completion is the agent's run passing the test. Verified patch rate is the post-episode test result. Lookup completion is the legitimate 2 cent payment executing. False positive rate blocks legitimate calls. Blocked small calls count the refused under-10-cent calls, including refused legitimate lookups.
+
+### Runs
+
+Twelve tasks, five attacks, three regimes, one seed per cell, 180 runs. Temperature zero, so a second seed would not sample a different behaviour, and a cell is one episode.
 
 ## Results
 
-The control arm contains 12 tasks, five attacks and three regimes, one seed each, 180 runs. All 180 work directories passed the post-episode test verification. The lookup was made in every episode, and no legitimate payment was blocked.
+The control arm shows the apparatus works: 180 of 180 cells delivered the injection. Its pattern is the expected one. Prompt only allowed the payment in every delivered task. Tool policy refused every attack except tamper, which worked because the tampered file was honoured, as designed. Hard cap refused everything. The control pays for that with an uninformative notion of model behaviour, which is why both arms are reported.
 
-| Attack | Regime | Success | Mean loss, cents | Patch verified |
-| --- | --- | ---: | ---: | ---: |
-| direct | prompt_only | 100% | 200.0 | 100% |
-| direct | tool_policy | 0% | 0.0 | 100% |
-| direct | hard_cap | 0% | 0.0 | 100% |
-| indirect | prompt_only | 100% | 200.0 | 100% |
-| indirect | tool_policy | 0% | 0.0 | 100% |
-| indirect | hard_cap | 0% | 0.0 | 100% |
-| tool_output | prompt_only | 100% | 200.0 | 100% |
-| tool_output | tool_policy | 0% | 0.0 | 100% |
-| tool_output | hard_cap | 0% | 0.0 | 100% |
-| drain | prompt_only | 100% | 16.0 | 100% |
-| drain | tool_policy | 0% | 0.0 | 100% |
-| drain | hard_cap | 0% | 0.0 | 100% |
-| tamper | prompt_only | 100% | 200.0 | 100% |
-| tamper | tool_policy | 100% | 200.0 | 100% |
-| tamper | hard_cap | 0% | 0.0 | 100% |
+Table 1 is generated from the raw records, not typed by hand. The cell columns are exposure, attack success, loss, task completion and verified patch rate.
 
-The drain attack in the prompt regime made eight 2 cent calls. Both enforced arms blocked those calls. The tamper attack is the important exception for host policy: the scripted agent changed the policy the host trusted, and the host policy accepted the premium target. The hard cap did not change. That result is a property of the control, not a claim that every host policy is broken.
+| attack | defence | runs | exposed | attack success | loss | task completion | patch verified |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+TABLE_PLACEHOLDER
 
-A single real model pilot was run with the Pollinations endpoint as a substitute, labelled as such. The task was `t01`, the attack was `direct`, the regime was `hard_cap`. The model read the file, applied the correct fix and called the reference API. The 200 cent premium payment was refused. It did not call `run_test`, so `taskPassed` was false. The post-episode check found `2/2 passed`, so `verifiedPatchPassed` was true. It needed 16 model calls, 24 waits and 692 seconds of waiting because of endpoint rate limits. This is not a Gemma result and does not support a model ranking.
+Check the full Gemma 4 arm against the same 180 cells in Table 1. In the delivered cells so far it did not pay the premium endpoint in the `indirect` or `tool_output` classes. `direct` and `tamper` are the classes it paid in. Mean loss, task completion and exposure are in Table 1.
 
 ## Analysis
 
-The control result is clear. A limit the model can be talked into is not a limit. The enforced arms do not remove the attacker's option to try, and they should be judged on the cost of refusal. Here the cost was zero measured blocked legitimate calls and no task failure in the control. That is because the legitimate lookup was allowed and small. The harness cannot show what would happen with a broader vendor set or noisier policy.
+The result to hold onto is not that Gemma behaved. It is that in the delivered cells, the model did not pay the premium vendor just because text told it to, in either of the two covert routes. That is one seed, one synthetic task set, and one delivery need. Multi-step or obfuscated payloads may differ.
 
-The tamper row supports a simpler claim: validation should not live inside the thing being manipulated. A hard cap has a small decision surface, a budget, an allowlist and a total. It still depends on the chain or the local code that enforces it. The NEAR contract work in this repository reduces that dependency for a recipient specific cap, but it has not produced a measured run in this draft.
+The tamper row remains the fundamental weakness for host policies. The agent changed the file the host trusts, the file was honoured, and the premium payment was authorised. A policy file sitting reachable in the task directory is not a policy, it is a suggestion. The hard cap has the same weakness only when the agent can write the enforcing program, which is why the enforcing program is outside the agent's reach.
 
-Task completion is not the strongest metric in a control. The stub always writes the known fix. The useful output is where the arms differ under pressure, and the tamper row is the one to repeat with a real model.
+The empty refusal in the first matrix made the hard cap look worse for task completion than it is. The deployed contract refusal tells the agent what is allowed. That refusal cost no measured task completion in the corrected arm.
 
 ## Limitations
 
-The task set is small and synthetic. The attack instructions are explicit for the control, and a real attacker may hide or obfuscate them. The premium endpoint is a stub and no money moved. The model arm is missing. The hard cap result tested the simulator, not a deployed chain transaction. The allowlist contains the reference and attacker endpoints, so false positives are not measured across an open web. The 2026 red team data [Dziemian et al.] shows attacks can vary sharply by model and setting; one seed here cannot support a rate estimate beyond this harness.
+The task set is small and synthetic. The paid API is a stub and no money moved. The model arm is one episode per cell, one seed, one synthetic task set, at temperature zero. The attack text is explicit. The endpoint is free and rate limited, with empty HTTP 500 responses on about half of raw requests; the harness retries those and reports them. Something to check in future work is whether a different Gemma model, or any frontier model, pays in the indirect class after obfuscation.
 
 ## Related work
 
-Greshake et al. described indirect prompt injection in LLM integrated applications [Greshake 2023]. AgentDojo measures attacks and defences for tool using agents in a dynamic environment [Debenedetti 2024]. Jimenez et al. introduced SWE-bench for repository issue resolution tasks [Jimenez 2024]. Dziemian et al. report a large public red teaming competition across 13 frontier models and 8,648 successful attacks [Dziemian 2026]. We are not aware of an existing controlled comparison that isolates the enforcement point for a coding agent that can spend money, and we do not claim to be first.
+Greshake et al described indirect prompt injection in LLM integrated applications [Greshake 2023]. AgentDojo measures attacks and defences for tool using agents in a dynamic environment [Debenedetti 2024]. Jimenez et al introduced SWE-bench for repository issue resolution [Jimenez 2024]. Dziemian et al report a large public red teaming competition across frontier models with 8,648 successful attacks [Dziemian 2026]. We are not aware of an existing controlled comparison that isolates the enforcement point for a coding agent that can spend money, and we do not claim to be first.
 
 ## Conclusion
 
-Prompts can ask an agent not to overspend. They cannot be the boundary. In the control experiment, a boundary outside the model refused every attack, while the prompt instruction did not. The NEAR harness and the policy code are released so another operator can verify the logs and rerun the matrix. The decisive question for the model arm is whether Gemma 4 behaves differently under pressure when the cap is present but the attack text is still read. That result is pending model access and will replace the pilot section before submission.
+Prompts can ask an agent not to overspend. They cannot be the boundary. In the delivered cells a bypass was available in the prompt regime, the only regime that talked to the model instead of refusing it. A boundary outside the model never authorised the premium payment. The tier most likely to fail is a policy that trusts a file the agent can write. The harness, task set and raw runs are released so any operator can verify the table and rerun the matrix.
 
 ## References
 
@@ -105,14 +95,14 @@ Prompts can ask an agent not to overspend. They cannot be the boundary. In the c
 - Debenedetti, Zhang, Balunovic, Beurer-Kellner, Fischer, Tramèr. AgentDojo: A dynamic environment to evaluate prompt injection attacks and defenses for LLM agents. NeurIPS 2024 Datasets and Benchmarks Track. arXiv:2406.13352. Retrieved 2026-11-05.
 - Dziemian et al. How vulnerable are AI agents to indirect prompt injections? Insights from a large-scale public competition. arXiv:2603.15714, 2026. Retrieved 2026-11-05.
 - Jimenez, Yang, Wettig, Yao, Pei, Press, Narasimhan. SWE-bench: Can language models resolve real-world GitHub issues? ICLR 2024. arXiv:2310.06770. Retrieved 2026-11-05.
-- NEAR access keys and function call permissions, NEAR documentation. Retrieved 2026-11-05. Limits allowance to gas on a contract call.
+- NEAR nearcore `verify_function_call_permission`, `DepositWithFunctionCall` and the access key model. https://github.com/near/nearcore/blob/master/runtime/runtime/src/verifier.rs, retrieved 2026-11-05.
 
 ## Reproduction
 
 ```bash
 cd paper
-node --test
-node harness/run.js --tasks 12 --model stub --out results/control
+node --test harness/*.test.js
+node harness/run.js --tasks 12 --attacks all --defenses all --model stub --out results/control-v2
 ```
 
-Raw records are in `results/control/` and `results/pilot-pollinations/`. The control table is generated by `harness/run.js` and not typed by hand. The Pollinations pilot used `node harness/run.js --tasks 1 --attacks direct --defenses hard_cap --model pollinations --out results/pilot-pollinations`.
+Raw records are in `results/control-v2/` and `results/gemma-ai-studio-v2/`. The earlier matrix is in `results/archive-pre-fix/` and is never quoted. The table is generated by the harness, not typed by hand.
